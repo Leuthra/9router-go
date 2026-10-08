@@ -657,7 +657,7 @@ func TranslateGeminiChunkToOpenAI(chunk []byte, state *GeminiStreamState) ([]byt
 					}
 					delta["tool_calls"] = []map[string]any{
 						{
-							"index": 0,
+							"index": state.ToolCallCount,
 							"id":    id,
 							"type":  "function",
 							"function": map[string]any{
@@ -666,6 +666,7 @@ func TranslateGeminiChunkToOpenAI(chunk []byte, state *GeminiStreamState) ([]byt
 							},
 						},
 					}
+					state.ToolCallCount++
 				}
 				if len(delta) > 0 {
 					results = append(results, map[string]any{
@@ -688,6 +689,10 @@ func TranslateGeminiChunkToOpenAI(chunk []byte, state *GeminiStreamState) ([]byt
 		// Finish reason
 		if candidate.FinishReason != "" {
 			openAIStop := geminiFinishToOpenAI(candidate.FinishReason)
+
+			if state.ToolCallCount > 0 && openAIStop == "stop" {
+				openAIStop = "tool_calls"
+			}
 
 			inputTokens, outputTokens, cachedTokens := 0, 0, 0
 			if geminiChunk.UsageMetadata != nil {
