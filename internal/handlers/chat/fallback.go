@@ -162,10 +162,17 @@ func (h *ChatHandler) handleAccountFallback(
 			}
 			// Account-scoped cooldown alongside the per-model locks, so the
 			// selector can skip this account before spending a request
-			// (upstream applyErrorState).
-			until := time.Now().UTC().Add(time.Duration(cooldownSec) * time.Second)
-			if lockErr := h.Repo.LockConnectionRateLimit(connObj.ID, until, classification.NewBackoffLevel, ue.StatusCode, errorText); lockErr != nil {
-				log.Warn("fallback", "rate limit lock failed", "conn", connObj.ID, "error", lockErr)
+			// (upstream applyErrorState). Only lock if error is account-scoped,
+			// not model-scoped (e.g. 401 auth issues), so unrelated models stay available.
+			if isModelScopedError(ue.StatusCode, errorText, model) {
+				if recErr := h.Repo.RecordConnectionError(connObj.ID, ue.StatusCode, errorText, classification.NewBackoffLevel); recErr != nil {
+					log.Warn("fallback", "record connection error failed", "conn", connObj.ID, "error", recErr)
+				}
+			} else {
+				until := time.Now().UTC().Add(time.Duration(cooldownSec) * time.Second)
+				if lockErr := h.Repo.LockConnectionRateLimit(connObj.ID, until, classification.NewBackoffLevel, ue.StatusCode, errorText); lockErr != nil {
+					log.Warn("fallback", "rate limit lock failed", "conn", connObj.ID, "error", lockErr)
+				}
 			}
 			log.Warn("fallback", "connection locked", append([]any{
 				"conn", connObj.ID, "provider", provider, "model", model,
@@ -221,6 +228,10 @@ type forwardRequestParams struct {
 	W                 http.ResponseWriter
 	Provider          string
 	Model             string
+	RequestedModel    string
+	ComboName         string
+	Protocol          string
+	StartedAt         time.Time
 	ConnectionID      string
 	ConnName          string // human-readable account name, for logs
 	ConnEmail         string
@@ -230,7 +241,6 @@ type forwardRequestParams struct {
 	TranslateResponse bool
 	Endpoint          string
 }
-
 func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	ctx, w := f.Ctx, f.W
 	provider, model := f.Provider, f.Model
@@ -317,7 +327,12 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 			claudeNative = true
 		}
 	}
+	compressStart := time.Now()
 	pipedBody, origTokens, savedTokens, savedPct := h.applyTokenSavers(body, claudeNative)
+	compressDurMs := int(time.Since(compressStart).Milliseconds())
+	if compressDurMs <= 0 {
+		compressDurMs = 1
+	}
 	var claudeToolMap map[string]string
 	if isAnthropic {
 		if !claudeNative {
@@ -463,6 +478,7 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 				OriginalInputTokens: origTokens,
 				SavedTokens:         savedTokens,
 				SavedPercent:        savedPct,
+				CompressionDurationMs: compressDurMs,
 			},
 			nil,
 			fwdErr,
@@ -669,16 +685,38 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 		if usage == nil {
 			usage = &translator.OpenAIUsage{}
 		}
+		reqModel := f.RequestedModel
+		if reqModel == "" {
+			reqModel = translator.RequestedModelFromContext(ctx)
+		}
+		if reqModel == "" {
+			reqModel = model
+		}
+		protocol := f.Protocol
+		if protocol == "" {
+			protocol = resolveProtocol(endpoint)
+		}
+		startedAt := f.StartedAt
+		if startedAt.IsZero() {
+			startedAt = time.Now().Add(-time.Duration(latencyMs) * time.Millisecond)
+		}
+
 		logInfo := &UsageLogInfo{
-			Provider:            provider,
-			Model:               model,
-			ConnectionID:        connectionID,
-			APIKey:              apiKey,
-			Endpoint:            endpoint,
-			Egress:              resolveEgress(connData, providerCfg).LogValue(),
-			OriginalInputTokens: origTokens,
-			SavedTokens:         savedTokens,
-			SavedPercent:        savedPct,
+			Provider:               provider,
+			Model:                  model,
+			RequestedModel:         reqModel,
+			ComboName:              f.ComboName,
+			Protocol:               protocol,
+			CacheSource:            resolveCacheSource(usage),
+			StartedAt:              startedAt,
+			ConnectionID:           connectionID,
+			APIKey:                 apiKey,
+			Endpoint:               endpoint,
+			Egress:                 resolveEgress(connData, providerCfg).LogValue(),
+			OriginalInputTokens:   origTokens,
+			SavedTokens:           savedTokens,
+			SavedPercent:          savedPct,
+			CompressionDurationMs: compressDurMs,
 		}
 		logInfo.ConnName, logInfo.ConnEmail = identityNames(h.connIdentityKVOr(f, connectionID))
 		h.logUsage(ctx, logInfo, usage, latencyMs, body, metrics)
@@ -699,18 +737,40 @@ func (h *ChatHandler) tryForwardWithConnection(f forwardRequestParams) error {
 	// request actually left through the pool.
 	identity = append(identity, "egress", resolveEgress(connData, providerCfg).LogValue())
 	connName, connEmail := identityNames(identity)
+	reqModel := f.RequestedModel
+	if reqModel == "" {
+		reqModel = translator.RequestedModelFromContext(ctx)
+	}
+	if reqModel == "" {
+		reqModel = model
+	}
+	protocol := f.Protocol
+	if protocol == "" {
+		protocol = resolveProtocol(endpoint)
+	}
+	startedAt := f.StartedAt
+	if startedAt.IsZero() {
+		startedAt = time.Now().Add(-time.Duration(latencyMs) * time.Millisecond)
+	}
+
 	h.LogFailure(
 		&UsageLogInfo{
-			Provider:            provider,
-			Model:               model,
-			ConnectionID:        connectionID,
-			ConnName:            connName,
-			ConnEmail:           connEmail,
-			Endpoint:            endpoint,
-			Egress:              resolveEgress(connData, providerCfg).LogValue(),
-			OriginalInputTokens: origTokens,
-			SavedTokens:         savedTokens,
-			SavedPercent:        savedPct,
+			Provider:               provider,
+			Model:                  model,
+			RequestedModel:         reqModel,
+			ComboName:              f.ComboName,
+			Protocol:               protocol,
+			StartedAt:              startedAt,
+			ConnectionID:           connectionID,
+			ConnName:               connName,
+			ConnEmail:              connEmail,
+			APIKey:                 apiKey,
+			Endpoint:               endpoint,
+			Egress:                 resolveEgress(connData, providerCfg).LogValue(),
+			OriginalInputTokens:   origTokens,
+			SavedTokens:           savedTokens,
+			SavedPercent:          savedPct,
+			CompressionDurationMs: compressDurMs,
 		},
 		usage,
 		fwdErr,
@@ -756,6 +816,9 @@ func isClientCanceled(ctx context.Context, err error) bool {
 // a role:"system" message is rejected by the Anthropic API.
 // false from compress/inject means nothing changed (or unparseable) — keep original, not a failure.
 func (h *ChatHandler) applyTokenSavers(body []byte, claudeNative bool) ([]byte, int, int, int) {
+	if h.TokenSaver == nil {
+		return body, 0, 0, 0
+	}
 	// Prompt-injection guard: tag (never block) flagged user content. Early
 	// detection here means operators can see abuse before it reaches upstream.
 	// Toggle via settings.injectionGuardEnabled (off bypasses the scan).
@@ -767,7 +830,8 @@ func (h *ChatHandler) applyTokenSavers(body []byte, claudeNative bool) ([]byte, 
 	out := body
 	var origTokens, savedTokens, savedPct int
 	if h.TokenSaver.RTKEnabled() {
-		if next, did := tokensaver.CompressMessages(out); did {
+		rtkCfg := h.TokenSaver.RTKConfig()
+		if next, did := tokensaver.CompressMessagesWithConfig(out, rtkCfg); did {
 			origTokens = len(out) / 4
 			compressedTokens := len(next) / 4
 			savedTokens = origTokens - compressedTokens
@@ -784,14 +848,25 @@ func (h *ChatHandler) applyTokenSavers(body []byte, claudeNative bool) ([]byte, 
 			out = next
 		}
 	}
+	if h.TokenSaver.CavemanInputMode() {
+		if next, did := tokensaver.CompressInputMessages(out, h.TokenSaver.CavemanPreserveKeywords()); did {
+			out = next
+		}
+	}
 	inject := tokensaver.InjectSystemPrompt
 	if claudeNative {
 		inject = tokensaver.InjectSystemPromptClaude
 	}
 	if h.TokenSaver.CavemanEnabled() {
-		prompt := tokensaver.GetCavemanPrompt(h.TokenSaver.CavemanLevel())
-		if next, did := inject(out, prompt); did {
-			out = next
+		bypass := false
+		if h.TokenSaver.CavemanAutoClarity() && tokensaver.ShouldBypassCaveman(out) {
+			bypass = true
+		}
+		if !bypass {
+			prompt := tokensaver.GetCavemanPromptWithLang(h.TokenSaver.CavemanLevel(), h.TokenSaver.CavemanLanguage())
+			if next, did := inject(out, prompt); did {
+				out = next
+			}
 		}
 	}
 	if h.TokenSaver.PonytailEnabled() {
@@ -807,6 +882,23 @@ func (h *ChatHandler) applyTokenSavers(body []byte, claudeNative bool) ([]byte, 
 		}
 	}
 	return out, origTokens, savedTokens, savedPct
+}
+
+func resolveProtocol(endpoint string) string {
+	if endpoint == "/v1/messages" {
+		return "Claude-Messages"
+	}
+	if strings.Contains(endpoint, "gemini") {
+		return "Gemini"
+	}
+	return "OpenAI-Chat"
+}
+
+func resolveCacheSource(u *translator.OpenAIUsage) string {
+	if u != nil && (u.CachedTokens > 0 || (u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens > 0)) {
+		return "Upstream (Provider)"
+	}
+	return "None"
 }
 
 // extractErrorText attempts to extract a human-readable error message from an upstream error JSON body.
@@ -1008,4 +1100,83 @@ func claudeSessionIDFromBody(body []byte) string {
 	}
 	userID, _ := meta["user_id"].(string)
 	return extractClaudeSessionIdFromUserId(userID)
+}
+
+func isAccountAuthFailure(lower string) bool {
+	return strings.Contains(lower, "no credentials") ||
+		strings.Contains(lower, "invalid_grant") ||
+		strings.Contains(lower, "invalid token") ||
+		strings.Contains(lower, "token type is not supported") ||
+		strings.Contains(lower, "authentication expired") ||
+		strings.Contains(lower, "token expired") ||
+		strings.Contains(lower, "account suspended") ||
+		strings.Contains(lower, "account disabled") ||
+		strings.Contains(lower, "incorrect api key") ||
+		strings.Contains(lower, "invalid api key") ||
+		strings.Contains(lower, "organization is not supported") ||
+		strings.Contains(lower, "insufficient funds for organization")
+}
+
+func isModelQuotaText(errorText string) bool {
+	upper := strings.ToUpper(errorText)
+	return strings.Contains(upper, "QUOTA_EXHAUSTED") ||
+		strings.Contains(errorText, "Individual quota reached") ||
+		strings.Contains(upper, "MODEL_CAPACITY_EXHAUSTED")
+}
+
+func mentionsGate(lower string) bool {
+	return strings.Contains(lower, "is not supported") ||
+		strings.Contains(lower, "not supported") ||
+		strings.Contains(lower, "model access is disabled") ||
+		strings.Contains(lower, "endpoint is unavailable")
+}
+
+// isModelScopedError reports whether an upstream retryable error is
+// specific to the requested model (e.g. 429 model quota, 402 insufficient funds
+// for paid models, or 401 "model is not supported") rather than an account-scoped
+// credential failure. For model-scoped errors, only LockConnectionModel and
+// RecordConnectionError are set so that unrelated healthy models on the same account
+// remain available.
+func isModelScopedError(statusCode int, errorText string, model string) bool {
+	if model == "" {
+		return false
+	}
+	lower := strings.ToLower(errorText)
+	if isAccountAuthFailure(lower) {
+		return false
+	}
+
+	// 1. Quota exhaustion markers (Antigravity Claude, etc.) on 429/403/503
+	if statusCode == http.StatusTooManyRequests || statusCode == http.StatusForbidden || statusCode == http.StatusServiceUnavailable {
+		if isModelQuotaText(errorText) {
+			return true
+		}
+	}
+
+	// 2. Model-gate verdicts only ever arrive on 400/401/402/403.
+	// A 5xx that merely says "not supported" is a node fault, not a model gate.
+	switch statusCode {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden:
+	default:
+		return false
+	}
+
+	// 402 Insufficient account funds on providers serving tiered models (e.g. Zen paid models)
+	if statusCode == http.StatusPaymentRequired {
+		if (strings.Contains(lower, "insufficient account funds") || strings.Contains(lower, "insufficient funds")) &&
+			!strings.Contains(lower, "credits are exhausted") && !strings.Contains(lower, "spending limit") {
+			return true
+		}
+	}
+
+	// 401/400/403: Body must name the requested model AND mention that the model is unsupported/disabled
+	cleanModel := strings.ToLower(model)
+	if idx := strings.LastIndex(cleanModel, "/"); idx != -1 {
+		cleanModel = cleanModel[idx+1:]
+	}
+	if (strings.Contains(lower, cleanModel) || strings.Contains(lower, strings.ToLower(model))) && mentionsGate(lower) {
+		return true
+	}
+
+	return false
 }

@@ -7,13 +7,14 @@
   import { Info, Search, X } from 'lucide-svelte'
   import { api, type Combo, type ProviderConnection, type ProviderNode } from '../../api/client'
   import ModelPill from './ModelPill.svelte'
-  import { getIconPath } from '../connections/types'
+  import ProviderArtwork from '../providers/ProviderArtwork.svelte'
   import {
     resolveFilteredCombos,
     resolveFilteredGroups,
     resolveModelPickerGroups,
   } from './pickerData'
   import { EMPTY_PICKER_EXTRAS, loadPickerExtras, type ResolvedPickerExtras } from './pickerExtras'
+  import { emailPrivacy, formatEmailLabel } from '../../lib/privacy'
 
   interface Props {
     isOpen: boolean
@@ -184,17 +185,13 @@
         {#each filteredGroups as group (group.id)}
           <div>
             <div class="flex items-center gap-1.5 mb-1.5 sticky top-0 bg-surface py-0.5 z-10">
-              <img
-                src={getIconPath(group.id)}
+              <ProviderArtwork
+                id={group.id}
                 alt={group.name}
-                class="w-3.5 h-3.5 object-contain rounded-sm"
-                loading="lazy"
-                onerror={(e) => {
-                  ;(e.currentTarget as HTMLImageElement).style.display = 'none'
-                }}
+                class="w-3.5 h-3.5 object-contain rounded-sm text-[9px] leading-none font-semibold"
               />
               <span class="text-xs font-medium text-brand-500">
-                {group.name}
+                {formatEmailLabel(group.name, $emailPrivacy)}
               </span>
               <span class="text-[10px] text-text-muted">
                 ({group.models.length})
