@@ -19,6 +19,11 @@ type GeminiStreamState struct {
 	Usage                *OpenAIUsage
 	FinishReason         string
 	LastThoughtSignature string
+	// ToolCallCount counts functionCall parts emitted so far. It gives each
+	// OpenAI tool_call its own index (parallel calls must not share index 0)
+	// and turns a Gemini STOP into finish_reason "tool_calls" so clients like
+	// Zed run the tools instead of ending the turn.
+	ToolCallCount int
 }
 
 // GeminiFileData represents remote or uploaded files referenced by URI.
