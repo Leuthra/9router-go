@@ -88,6 +88,9 @@ func (h *MediaHandler) HandleEmbeddings(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	if !h.ChatH.EnforceModelAccess(w, r, reqBody.Model) {
+		return
+	}
 	modelInfo, err := h.ChatH.ResolveModel(reqBody.Model)
 	if err != nil {
 		handlerutil.WriteJSONError(w, http.StatusBadRequest, err.Error())
@@ -193,6 +196,9 @@ func (h *MediaHandler) HandleSystemone(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.Unmarshal(body, &reqBody); err != nil || reqBody.Model == "" {
 		handlerutil.WriteJSONError(w, http.StatusBadRequest, "missing model")
+		return
+	}
+	if !h.ChatH.EnforceModelAccess(w, r, reqBody.Model) {
 		return
 	}
 	h.forwardSystemoneRequest(w, r, body, reqBody.Model)
@@ -612,6 +618,13 @@ func (h *MediaHandler) forwardMediaRequest(w http.ResponseWriter, r *http.Reques
 			}
 		}
 	}
+	// Per-API-key access control. This is the single funnel for images, TTS,
+	// STT, video, search, scrape and fetch, so gating here covers all of them
+	// with the same decision the chat lane uses. It runs before any connection
+	// selection so a denied model never reaches a provider.
+	if !h.ChatH.EnforceModelAccess(w, r, model) {
+		return
+	}
 	modelInfo, err := h.ChatH.ResolveModel(model)
 	if err != nil {
 		log.Warn("media", "resolve model failed", "endpoint", endpoint, "model", model, "error", err)
@@ -653,8 +666,27 @@ func (h *MediaHandler) forwardMediaRequest(w http.ResponseWriter, r *http.Reques
 					continue
 				}
 			}
+			// Codex image models are Responses-API models, not an image endpoint.
+			if (endpoint == "/v1/images/generations" || endpoint == "/images/generations") && (subInfo.Provider == "codex" || subInfo.Provider == "cx") {
+				if err := h.handleCodexImage(w, r, body, subInfo); err == nil {
+					return
+				} else {
+					lastErr = err.Error()
+					continue
+				}
+			}
 			if (endpoint == "/v1/audio/transcriptions" || endpoint == "/audio/transcriptions") && (subInfo.Provider == "antigravity" || subInfo.Provider == "ag") {
 				if err := h.handleAntigravitySTT(w, r, body, subInfo); err == nil {
+					return
+				} else {
+					lastErr = err.Error()
+					continue
+				}
+			}
+			// ElevenLabs Scribe: the vendor rejects the generic OpenAI-compatible
+			// multipart body (model_id / language_code / xi-api-key).
+			if (endpoint == "/v1/audio/transcriptions" || endpoint == "/audio/transcriptions") && (subInfo.Provider == "elevenlabs" || subInfo.Provider == "el") {
+				if err := h.handleElevenLabsSTT(w, r, body, subInfo); err == nil {
 					return
 				} else {
 					lastErr = err.Error()
@@ -785,8 +817,24 @@ func (h *MediaHandler) forwardMediaRequest(w http.ResponseWriter, r *http.Reques
 		}
 		return
 	}
+	// Codex image models are Responses-API models, not an image endpoint.
+	if (endpoint == "/v1/images/generations" || endpoint == "/images/generations") && (modelInfo.Provider == "codex" || modelInfo.Provider == "cx") {
+		if err := h.handleCodexImage(w, r, body, modelInfo); err != nil {
+			handlerutil.WriteJSONError(w, http.StatusBadGateway, err.Error())
+		}
+		return
+	}
 	if (endpoint == "/v1/audio/transcriptions" || endpoint == "/audio/transcriptions") && (modelInfo.Provider == "antigravity" || modelInfo.Provider == "ag") {
 		if err := h.handleAntigravitySTT(w, r, body, modelInfo); err != nil {
+			handlerutil.WriteJSONError(w, http.StatusBadGateway, err.Error())
+		}
+		return
+	}
+
+	// ElevenLabs Scribe: the vendor rejects the generic OpenAI-compatible
+	// multipart body (model_id / language_code / xi-api-key).
+	if (endpoint == "/v1/audio/transcriptions" || endpoint == "/audio/transcriptions") && (modelInfo.Provider == "elevenlabs" || modelInfo.Provider == "el") {
+		if err := h.handleElevenLabsSTT(w, r, body, modelInfo); err != nil {
 			handlerutil.WriteJSONError(w, http.StatusBadGateway, err.Error())
 		}
 		return

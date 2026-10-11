@@ -7,6 +7,9 @@
   import Input from '../lib/ui/Input.svelte'
   import Modal from '../lib/ui/Modal.svelte'
   import Toggle from '../lib/ui/Toggle.svelte'
+  import Menu from '../lib/ui/Menu.svelte'
+  import MenuItem from '../lib/ui/MenuItem.svelte'
+  import CountedSelect from '../lib/ui/CountedSelect.svelte'
   import { api, getAuthHeaders, type ProxyPool } from '../api/client'
   import { notifications } from '../lib/notifications'
   import { parseProxyLine } from '../lib/proxy-import'
@@ -63,6 +66,7 @@
   let showVercelModal = $state(false)
   let showCloudflareModal = $state(false)
   let showDenoModal = $state(false)
+  let showNetlifyModal = $state(false)
   let showRelayMenu = $state(false)
   let editingPool = $state<ProxyPool | null>(null)
   let formData = $state<PoolForm>(normalizeFormData())
@@ -70,6 +74,7 @@
   let vercelForm = $state({ vercelToken: '', projectName: 'vercel-relay' })
   let cloudflareForm = $state({ accountId: '', apiToken: '', projectName: 'cloudflare-relay' })
   let denoForm = $state({ denoToken: '', orgDomain: '', projectName: '' })
+  let netlifyForm = $state({ netlifyToken: '', projectName: 'netlify-relay' })
   let saving = $state(false)
   let importing = $state(false)
   let deploying = $state(false)
@@ -142,11 +147,11 @@
   let filteredPools = $derived(filterProxyPools(proxyPools, statusFilter))
   let displayedPools = $derived(sortProxyPools(filteredPools, sortOption))
 
-  const PILL_BASE = 'px-2.5 py-1 text-xs rounded-lg border transition-colors cursor-pointer'
-  const PILL_ACTIVE = 'border-primary bg-primary/10 text-primary font-medium'
-  const PILL_IDLE = 'border-border text-text-muted hover:border-brand-500/40 hover:text-text-main'
-
-  let statusPills = $derived([
+  // The status filter is a dropdown rather than four pills with the count in
+  // brackets: beside the sort picker and the two bulk-cleanup buttons that row
+  // was the widest fixed thing left on the page, and it wrapped to three lines
+  // on a phone (issue #261).
+  let statusOptions = $derived([
     { value: 'all', label: 'All', count: proxyPools.length },
     { value: 'active', label: 'Active', count: counts.active },
     { value: 'passed', label: 'Passed', count: counts.passed },
@@ -234,6 +239,16 @@
   function closeDenoModal() {
     if (deploying) return
     showDenoModal = false
+  }
+
+  function openNetlifyModal() {
+    netlifyForm = { netlifyToken: '', projectName: 'netlify-relay' }
+    showNetlifyModal = true
+  }
+
+  function closeNetlifyModal() {
+    if (deploying) return
+    showNetlifyModal = false
   }
 
   async function handleSave() {
@@ -683,6 +698,25 @@
       deploying = false
     }
   }
+
+  async function handleNetlifyDeploy() {
+    if (!netlifyForm.netlifyToken.trim()) return
+    deploying = true
+    try {
+      const data = await api.deployNetlifyRelay({
+        netlifyToken: netlifyForm.netlifyToken.trim(),
+        projectName: netlifyForm.projectName.trim() || undefined,
+      })
+      await fetchProxyPools()
+      closeNetlifyModal()
+      notifications.success(`Deployed: ${data.deployUrl || data.proxyUrl || ''}`)
+    } catch (err) {
+      console.log('Error deploying Netlify relay:', err)
+      notifications.error(err instanceof Error ? err.message : 'Deploy failed')
+    } finally {
+      deploying = false
+    }
+  }
 </script>
 
 <!-- The one-pool form is shared by the Single tab and the edit dialog, so the
@@ -740,23 +774,11 @@
         <h1 class="text-xl font-semibold sm:text-2xl">Proxy Pools</h1>
       </div>
 
-      <div class="grid grid-cols-1 gap-2 sm:flex sm:items-center">
-        <Button
-          size="sm"
-          variant="secondary"
-          onclick={() => handleHealthCheck(true)}
-          disabled={healthChecking || proxyPools.length === 0}
-        >
-          <span
-            class="material-symbols-outlined text-[18px]"
-            style={healthChecking ? 'animation: spin 1s linear infinite' : undefined}
-          >
-            {healthChecking ? 'progress_activity' : 'speed'}
-          </span>
-          {healthChecking
-            ? `Testing ${healthProgress.current}/${healthProgress.total}`
-            : 'Test All'}
-        </Button>
+      <!-- Test All, Batch Import and Add Proxy Pool moved into one menu: the
+           header held four controls and wrapped on a phone (issue #261). The
+           relay deployer keeps its own trigger — it is a separate task with
+           its own submenu, not one more verb in this list. -->
+      <div class="flex flex-wrap items-center gap-2">
 
         <div class="relative" bind:this={relayMenuRef}>
           <Button
@@ -808,36 +830,50 @@
                 <span class="material-symbols-outlined text-[20px] text-green-500">terminal</span>
                 Deno Relay
               </button>
+              <button
+                type="button"
+                onclick={() => {
+                  openNetlifyModal()
+                  showRelayMenu = false
+                }}
+                class="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-text-main transition-colors hover:bg-black/5 dark:hover:bg-white/5 cursor-pointer"
+              >
+                <span class="material-symbols-outlined text-[20px] text-teal-500">deployed_code</span>
+                Netlify Relay
+              </button>
             </div>
           {/if}
         </div>
 
-        <Button size="sm" variant="secondary" onclick={() => openCreateModal('bulk')}>
-          <span class="material-symbols-outlined text-[18px]">upload</span>
-          Batch Import
-        </Button>
-        <Button size="sm" onclick={() => openCreateModal('single')}>
-          <span class="material-symbols-outlined text-[18px]">add</span>
-          Add Proxy Pool
-        </Button>
+        <Menu label="Proxy pool actions" triggerIcon="menu" minWidth="15rem">
+          <MenuItem
+            label={healthChecking
+              ? `Testing ${healthProgress.current}/${healthProgress.total}`
+              : 'Test All'}
+            icon={healthChecking ? 'progress_activity' : 'speed'}
+            disabled={healthChecking || proxyPools.length === 0}
+            onSelect={() => handleHealthCheck(true)}
+          />
+
+          <div class="my-1 border-t border-border-subtle" role="separator"></div>
+
+          <MenuItem label="Add Proxy Pool" icon="add" onSelect={() => openCreateModal('single')} />
+          <MenuItem label="Batch Import" icon="upload" onSelect={() => openCreateModal('bulk')} />
+        </Menu>
       </div>
     </div>
 
     <Card>
       <!-- Filter & Sort Controls & Quick Cleanup -->
       <div class="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-        <!-- Filter pills -->
-        <div class="flex items-center gap-1.5 flex-wrap">
-          {#each statusPills as pill (pill.value)}
-            <button
-              type="button"
-              aria-pressed={statusFilter === pill.value}
-              class="{PILL_BASE} {statusFilter === pill.value ? PILL_ACTIVE : PILL_IDLE}"
-              onclick={() => (statusFilter = pill.value)}
-            >
-              {pill.label} <span class="ml-1 opacity-75">({pill.count})</span>
-            </button>
-          {/each}
+        <div class="flex items-center gap-1.5">
+          <span class="text-xs text-text-muted shrink-0">Filter:</span>
+          <CountedSelect
+            value={statusFilter}
+            options={statusOptions}
+            ariaLabel="Filter proxy pools by status"
+            onChange={(next) => (statusFilter = next as PoolStatusFilter)}
+          />
         </div>
 
         <!-- Sort & Quick Cleanup -->
@@ -1015,6 +1051,12 @@
                     {/if}
                     {#if pool.type === 'cloudflare'}
                       <Badge size="sm">cloudflare relay</Badge>
+                    {/if}
+                    {#if pool.type === 'deno'}
+                      <Badge size="sm">deno relay</Badge>
+                    {/if}
+                    {#if pool.type === 'netlify'}
+                      <Badge size="sm">netlify relay</Badge>
                     {/if}
                     <Badge size="sm">
                       {pool.boundConnectionCount || 0} bound
@@ -1274,6 +1316,69 @@
             {deploying ? 'Deploying...' : 'Deploy Relay'}
           </Button>
           <Button fullWidth variant="ghost" onclick={closeDenoModal} disabled={deploying}>
+            Cancel
+          </Button>
+        </div>
+      </div>
+    </Modal>
+
+    <Modal
+      isOpen={showNetlifyModal}
+      title="Deploy Netlify Relay"
+      onClose={closeNetlifyModal}
+    >
+      <div class="flex flex-col gap-4">
+        <div
+          class="rounded-lg bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 p-3 flex flex-col gap-1.5"
+        >
+          <p class="text-sm text-text-main font-medium">What is Netlify Relay?</p>
+          <p class="text-xs text-text-muted">
+            Deploys a serverless relay function to Netlify's global edge network. All AI provider
+            requests are forwarded through Netlify's edge, masking your real IP.
+          </p>
+          <ul class="text-xs text-text-muted list-disc pl-4 space-y-0.5">
+            <li>
+              Runs on Netlify Functions with a streaming response and a 30-second execution limit
+            </li>
+            <li>Free tier: 125,000 function invocations and 100GB bandwidth per month</li>
+            <li>Relay URL format: https://your-site.netlify.app/.netlify/functions/relay</li>
+            <li>Deploy multiple relays on different accounts for more IP diversity</li>
+          </ul>
+          <div
+            class="mt-2 pt-2 border-t border-black/10 dark:border-white/10 text-xs text-text-muted"
+          >
+            <p class="font-medium text-text-main mb-1">How to generate API token:</p>
+            <ol class="list-decimal pl-4 space-y-0.5">
+              <li>Go to <b>User Settings</b> → <b>Applications</b> → <b>Personal access tokens</b></li>
+              <li>Select <b>New access token</b> and generate a token</li>
+              <li>Copy the token — you won't see it again after leaving the page</li>
+            </ol>
+          </div>
+        </div>
+        <div>
+          <Input
+            label="Netlify API Token"
+            type="password"
+            bind:value={netlifyForm.netlifyToken}
+            placeholder="nfp_xxxxxxxxxxxxxxxx"
+          />
+          <p class="text-xs text-text-muted mt-1">Token is used once for deployment, not stored.</p>
+        </div>
+        <Input
+          label="Site Name"
+          bind:value={netlifyForm.projectName}
+          placeholder="netlify-relay"
+          hint="Unique site name (lowercase letters, numbers, hyphens). Your relay URL will be https://site-name.netlify.app/.netlify/functions/relay"
+        />
+        <div class="grid grid-cols-1 gap-2 sm:grid-cols-2">
+          <Button
+            fullWidth
+            onclick={handleNetlifyDeploy}
+            disabled={!netlifyForm.netlifyToken.trim() || deploying}
+          >
+            {deploying ? 'Deploying...' : 'Deploy Relay'}
+          </Button>
+          <Button fullWidth variant="ghost" onclick={closeNetlifyModal} disabled={deploying}>
             Cancel
           </Button>
         </div>
